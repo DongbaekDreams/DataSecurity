@@ -1,2 +1,7 @@
 data/
 mnist/
+cache/
+combination/
+hydra/
+__pycache__/
+
