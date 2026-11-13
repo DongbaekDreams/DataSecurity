@@ -3,5 +3,10 @@ mnist/
 cache/
 combination/
 hydra/
+lenets/
 __pycache__/
+**/checkpoints/
+*.pth
+.DS_Store
+_extract_pdf_urls.py
 
