@@ -59,8 +59,9 @@ def parse_args():
     )
     p.add_argument(
         "--detect",
-        choices=("cosine_l2", "cosine", "l2", "multi_krum"),
-        default="cosine_l2",
+        choices=("combined", "cosine_l2", "cosine", "l2", "multi_krum"),
+        default="combined",
+        help="combined = cosine + L2 + Multi-Krum (covers all proposal attacks)",
     )
     p.add_argument(
         "--aggregate",
@@ -81,6 +82,7 @@ def main():
         raise SystemExit("--attack-round must be >= 2")
 
     malicious_client.ATTACK_TYPE = args.attack
+    malicious_client.MODEL_NAME = args.model
     device = get_device()
     torch.manual_seed(args.seed)
     print(f"Device: {device}")

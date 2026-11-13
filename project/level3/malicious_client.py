@@ -9,8 +9,9 @@ import torch
 from torch.utils.data import DataLoader
 import torch.nn.functional as F
 
-ATTACK_TYPE = "sign_flip"
+ATTACK_TYPE = "sign_flip"  # sign_flip | gaussian | scale | label_flip
 ATTACK_SCALE = 10.0
+MODEL_NAME = "wide"  # set by level3/train.py to match --model
 
 
 def generate_malicious_update(client_model_state_dict, local_dataset, device):
@@ -41,7 +42,7 @@ def generate_malicious_update(client_model_state_dict, local_dataset, device):
     # sign_flip / label_flip: one local epoch on the real model, then poison
     from shared.models import make_model
 
-    model = make_model("wide").to(device)
+    model = make_model(MODEL_NAME).to(device)
     model.load_state_dict(global_state)
     opt = torch.optim.SGD(model.parameters(), lr=0.05, momentum=0.9, nesterov=True)
     loader = DataLoader(local_dataset, batch_size=50, shuffle=True)

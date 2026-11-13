@@ -1,4 +1,10 @@
-'''Proposal defense methods (Sec 4): cosine + L2 detection, trimmed mean, Multi-Krum.'''
+'''Proposal Sec 4 defense: combined anomaly detection + robust aggregation.
+
+Detection combines cosine consensus (sign-flip), L2 vs median (gaussian/scale),
+and Multi-Krum distance (stealthier / label-flip). Whichever signal is strongest
+flags the client. Aggregation excludes flagged clients then applies trimmed mean
+(with Multi-Krum available as an alternate aggregator).
+'''
 
 import torch
 
@@ -31,41 +37,87 @@ def l2_norm_scores(deltas):
     return [state_dict_to_vector(d).norm().item() for d in deltas]
 
 
-def detect_malicious(global_state, client_states, max_flag=1, method="cosine_l2"):
-    '''Flag suspicious clients. method: cosine_l2 | cosine | l2 | multi_krum.'''
+def multi_krum_scores(deltas, f=1):
+    '''Higher = more outlier-like (sum of distances to nearest n-f-2 neighbors).'''
+    n = len(deltas)
+    vecs = [state_dict_to_vector(d) for d in deltas]
+    scores = []
+    keep = max(1, n - f - 2)
+    for i in range(n):
+        dists = sorted((vecs[i] - vecs[j]).norm().item() for j in range(n) if i != j)
+        scores.append(sum(dists[:keep]))
+    return scores
+
+
+def _minmax(xs):
+    lo, hi = min(xs), max(xs)
+    if hi - lo < 1e-12:
+        return [0.0] * len(xs)
+    return [(x - lo) / (hi - lo) for x in xs]
+
+
+def detect_malicious(global_state, client_states, max_flag=1, method="combined"):
+    '''
+    method:
+      combined   — hard outlier rules + max(cosine, L2, Multi-Krum)  [default]
+      cosine     — directional only
+      l2         — magnitude only
+      multi_krum — distance-to-neighbors only
+      cosine_l2  — cosine + L2 (no Krum)
+    '''
     deltas = update_deltas(global_state, client_states)
     cos_scores = cosine_consensus_scores(deltas)
     norms = l2_norm_scores(deltas)
+    krum_scores = multi_krum_scores(deltas, f=max_flag)
     med = sorted(norms)[len(norms) // 2]
     n = len(client_states)
 
-    if method == "cosine":
-        order = sorted(range(n), key=lambda i: cos_scores[i])
-    elif method == "l2":
-        order = sorted(range(n), key=lambda i: -abs(norms[i] - med))
-    elif method == "multi_krum":
-        # Score = sum of distances to nearest (n - f - 2) neighbors; high = bad.
-        f = max_flag
-        vecs = [state_dict_to_vector(d) for d in deltas]
-        scores = []
-        for i in range(n):
-            dists = sorted((vecs[i] - vecs[j]).norm().item() for j in range(n) if i != j)
-            keep = max(1, n - f - 2)
-            scores.append(sum(dists[:keep]))
-        order = sorted(range(n), key=lambda i: -scores[i])
-        details = {"cosine": cos_scores, "l2": norms, "krum": scores, "flagged": order[:max_flag]}
-        return order[:max_flag], details
-    else:
-        # cosine_l2 (default): weak cosine, L2 distance from median as secondary
-        suspicion = []
-        for i, (c, nrm) in enumerate(zip(cos_scores, norms)):
-            rel = abs(nrm - med) / max(med, 1e-12)
-            suspicion.append((c - 0.1 * rel, i))
-        suspicion.sort()
-        order = [i for _, i in suspicion]
+    # Anomaly directions: larger = more suspicious
+    cos_anom = [1.0 - c for c in cos_scores]
+    l2_anom = [abs(nrm - med) / max(med, 1e-12) for nrm in norms]
+    krum_anom = list(krum_scores)
 
-    flagged = order[:max_flag]
-    return flagged, {"cosine": cos_scores, "l2": norms, "flagged": flagged}
+    cos_n = _minmax(cos_anom)
+    l2_n = _minmax(l2_anom)
+    krum_n = _minmax(krum_anom)
+
+    if method == "cosine":
+        anom = cos_n
+    elif method == "l2":
+        anom = l2_n
+    elif method == "multi_krum":
+        anom = krum_n
+    elif method == "cosine_l2":
+        anom = [max(c, l) for c, l in zip(cos_n, l2_n)]
+    else:
+        # combined: any strong signal can flag (covers all proposal attack types)
+        anom = [max(c, l, k) for c, l, k in zip(cos_n, l2_n, krum_n)]
+
+    # Hard rules so extreme magnitude / inverted updates cannot hide after a
+    # poisoned global makes relative rankings noisy (critical for scale/gaussian).
+    hard = []
+    for i in range(n):
+        if norms[i] > 3.0 * max(med, 1e-12):
+            hard.append(i)
+        elif cos_scores[i] < 0.0:
+            hard.append(i)
+    if hard:
+        # Prefer the most extreme hard outlier(s)
+        hard = sorted(hard, key=lambda i: -anom[i])
+        flagged = hard[:max_flag]
+    else:
+        order = sorted(range(n), key=lambda i: -anom[i])
+        flagged = order[:max_flag]
+
+    details = {
+        "cosine": cos_scores,
+        "l2": norms,
+        "krum": krum_scores,
+        "anomaly": anom,
+        "hard": hard,
+        "flagged": flagged,
+    }
+    return flagged, details
 
 
 def trimmed_mean(states, trim_ratio=0.1):
@@ -88,17 +140,11 @@ def trimmed_mean(states, trim_ratio=0.1):
 
 
 def multi_krum_aggregate(global_state, client_states, f=1, m=None):
-    '''Select m most consistent updates (Multi-Krum) then average them.'''
     n = len(client_states)
     if m is None:
         m = max(1, n - f)
     deltas = update_deltas(global_state, client_states)
-    vecs = [state_dict_to_vector(d) for d in deltas]
-    scores = []
-    for i in range(n):
-        dists = sorted((vecs[i] - vecs[j]).norm().item() for j in range(n) if i != j)
-        keep = max(1, n - f - 2)
-        scores.append(sum(dists[:keep]))
+    scores = multi_krum_scores(deltas, f=f)
     chosen = sorted(range(n), key=lambda i: scores[i])[:m]
     return fedavg([client_states[i] for i in chosen]), chosen, scores
 
@@ -108,20 +154,18 @@ def robust_aggregate(
     client_states,
     weights=None,
     max_flag=1,
-    detect="cosine_l2",
+    detect="combined",
     aggregate="trimmed_mean",
     trim_ratio=0.1,
 ):
-    '''
-    detect: cosine_l2 | cosine | l2 | multi_krum
-    aggregate: trimmed_mean | fedavg | multi_krum
-    '''
     if aggregate == "multi_krum":
         agg, chosen, scores = multi_krum_aggregate(global_state, client_states, f=max_flag)
         flagged = [i for i in range(len(client_states)) if i not in set(chosen)]
         return agg, {"flagged": flagged[:max_flag], "kept": chosen, "krum": scores}
 
-    flagged, details = detect_malicious(global_state, client_states, max_flag=max_flag, method=detect)
+    flagged, details = detect_malicious(
+        global_state, client_states, max_flag=max_flag, method=detect,
+    )
     keep = [i for i in range(len(client_states)) if i not in set(flagged)]
     if not keep:
         keep = list(range(len(client_states)))
